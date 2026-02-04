@@ -366,7 +366,7 @@ data_q3 <- df %>%
     booklet = Booklet_min,
     cap = MEMs_min,
     
-    # Friend's piecewise variables
+    # piecewise variables
     t1_30 = pmin(cap, 30),
     t2_30 = pmax(cap - 30, 0),
     
@@ -379,7 +379,7 @@ data_q3_cort <- data_q3 %>%
   mutate(log_cort = log(Cortisol))
 
 # DHEA: EXCLUDE problem subjects (e.g., Subject 3037)
-# This is where we finally remove Subject 3037!
+# remove Subject 3037
 data_q3_dhea <- data_q3 %>%
   filter(!is.na(DHEA) & DHEA > 0) %>%
   filter(!(SubjectID %in% problem_subjects)) %>%  # Exclude here!
