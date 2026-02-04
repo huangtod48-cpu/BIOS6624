@@ -1,0 +1,538 @@
+---
+title: "project0"
+output: html_document
+---
+
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(lme4)
+library(lmerTest)
+
+
+# CONSTANTS
+CORTISOL_MAX <- 80        # Upper limit for valid Cortisol values (nmol/L)
+DHEA_LIMIT <- 5.205       # Detection limit for DHEA (nmol/L)
+DHEA_TOL <- 1e-6          # Tolerance for comparing DHEA to limit
+
+df <- read.csv("Project0_Clean_v2.csv", stringsAsFactors = FALSE)
+
+
+# 2. IDENTIFY DHEA PROBLEM SUBJECTS (BEFORE ANY PROCESSING)
+# Mark which DHEA values are at the detection limit
+df <- df %>%
+  mutate(DHEA_at_limit_raw = !is.na(DHEA..nmol.L.) & 
+                              abs(DHEA..nmol.L. - DHEA_LIMIT) < DHEA_TOL)
+
+# Find problem subjects (>25% at limit)
+problem_subjects <- df %>%
+  group_by(SubjectID) %>%
+  summarise(
+    total_dhea = sum(!is.na(DHEA..nmol.L.)),
+    at_limit = sum(DHEA_at_limit_raw, na.rm = TRUE),
+    pct_limit = ifelse(total_dhea > 0, 100 * at_limit / total_dhea, 0),
+    .groups = "drop"
+  ) %>%
+  filter(total_dhea > 0, pct_limit > 25) %>%
+  pull(SubjectID)
+
+
+# 3. TIME PARSING
+parse_time <- function(x) {
+  if (length(x) == 0 || is.na(x) || x == "") return(NA)
+  tryCatch(parse_date_time(x, "HM", quiet = TRUE), error = function(e) NA)
+}
+
+df$Booklet_parsed <- as.POSIXct(sapply(df$Booket..Clock.Time, parse_time), 
+                                 origin = "1970-01-01")
+df$MEMs_parsed <- as.POSIXct(sapply(df$MEMs..Clock.Time, parse_time), 
+                              origin = "1970-01-01")
+df$Sleep_parsed <- as.POSIXct(sapply(df$Sleep.Diary.reported.wake.time, parse_time), 
+                               origin = "1970-01-01")
+
+
+
+# 4. CALCULATE WAKE TIMES
+wake_times <- df %>%
+  filter(Collection.Sample == 1) %>%
+  group_by(SubjectID, Collection.Date) %>%  # FIXED: was DAYNUMB, now Collection.Date
+  summarise(wake_time = first(Sleep_parsed[!is.na(Sleep_parsed)], default = NA),
+            .groups = 'drop')
+
+# Sanity check - verify each subject-date has only one wake time
+wake_check <- df %>%
+  left_join(wake_times, by = c("SubjectID", "Collection.Date")) %>%
+  group_by(SubjectID, Collection.Date) %>%
+  summarise(n_wake = n_distinct(wake_time, na.rm = TRUE), .groups = "drop") %>%
+  count(n_wake)
+
+print(wake_check)
+if (any(wake_check$n_wake > 1)) {
+  warning("Multiple wake times per subject-date detected!")
+}
+
+
+
+# 5. CALCULATE MINUTES SINCE WAKE
+
+df <- df %>%
+  left_join(wake_times, by = c("SubjectID", "Collection.Date")) %>%  # FIXED key
+  mutate(
+    # Calculate time difference in minutes
+    Booklet_min = as.numeric(difftime(Booklet_parsed, wake_time, units = "mins")),
+    MEMs_min = as.numeric(difftime(MEMs_parsed, wake_time, units = "mins")),
+    
+    # Handle midnight rollover: add 24 hours (1440 min) if negative
+    Booklet_min = ifelse(!is.na(Booklet_min) & Booklet_min < 0, 
+                         Booklet_min + 1440, Booklet_min),
+    MEMs_min = ifelse(!is.na(MEMs_min) & MEMs_min < 0, 
+                      MEMs_min + 1440, MEMs_min),
+    
+    # Sanity check: remove impossible values (<0 or >1200 minutes)
+    Booklet_min = ifelse(!is.na(Booklet_min) & (Booklet_min < 0 | Booklet_min > 1200), 
+                         NA, Booklet_min),
+    MEMs_min = ifelse(!is.na(MEMs_min) & (MEMs_min < 0 | MEMs_min > 1200), 
+                      NA, MEMs_min)
+  )
+
+
+# 6. CLEAN DATA
+
+df <- df %>%
+  rename(Cortisol = Cortisol..nmol.L., DHEA = DHEA..nmol.L.)
+
+# Save before cleaning for accurate exclusion counts
+df_before_clean <- df
+
+# Clean: remove outliers and values at detection limit
+df <- df %>%
+  mutate(
+    # Cortisol: remove values >80 nmol/L
+    Cortisol = ifelse(!is.na(Cortisol) & Cortisol > CORTISOL_MAX, NA, Cortisol),
+    
+    # DHEA: remove values at detection limit (=5.205)
+    DHEA_at_limit = !is.na(DHEA) & abs(DHEA - DHEA_LIMIT) < DHEA_TOL,
+    DHEA = ifelse(DHEA_at_limit, NA, DHEA)
+    
+    # NOTE: We do NOT remove Subject 3037 here!
+    # It will be removed only for DHEA analysis in Q3
+  )
+
+# Count exclusions from BEFORE cleaning
+cort_excluded_n <- sum(!is.na(df_before_clean$Cortisol) & is.na(df$Cortisol))
+dhea_limit_n <- sum(df_before_clean$DHEA_at_limit, na.rm = TRUE)
+
+
+# TABLE 0: STUDY OVERVIEW & MISSING DATA
+
+n_subjects <- n_distinct(df$SubjectID)
+n_days <- n_distinct(df$DAYNUMB)
+n_samples_per_day <- n_distinct(df$Collection.Sample)
+
+# Calculate wake time missing rate only for Sample 1
+# (Wake time is only recorded in Sample 1)
+wake_missing <- sum(is.na(df$Sleep_parsed[df$Collection.Sample == 1]))
+wake_total <- sum(df$Collection.Sample == 1)
+wake_pct <- 100 * wake_missing / wake_total
+
+table0 <- data.frame(
+  Variable = c(
+    "Study Design:",
+    "  Subjects (n)",
+    "  Days per subject",
+    "  Samples per day",
+    "  Total observations",
+    "",
+    "Time Variables:",
+    "  Collection Date",
+    "  Booklet clock time",
+    "  MEMs clock time",
+    "  Sleep Diary wake time (Sample 1 only)",  # CLARIFIED
+    "  Booklet minutes since wake",
+    "  MEMs minutes since wake",
+    "",
+    "Outcome Variables:",
+    "  Cortisol (nmol/L)",
+    "  DHEA (nmol/L)"
+  ),
+  Total_N = c(
+    "", as.character(n_subjects), as.character(n_days), 
+    as.character(n_samples_per_day), as.character(nrow(df)),
+    "",
+    "", 
+    as.character(nrow(df)),  # Collection Date
+    as.character(nrow(df)),  # Booklet clock time
+    as.character(nrow(df)),  # MEMs clock time
+    as.character(wake_total),  # Sleep Diary (only Sample 1)
+    as.character(nrow(df)),  # Booklet minutes
+    as.character(nrow(df)),  # MEMs minutes
+    "",
+    "", 
+    as.character(nrow(df)),  # Cortisol
+    as.character(nrow(df))   # DHEA
+  ),
+  Missing_N = c(
+    "", "", "", "", "",
+    "",
+    "",
+    as.character(sum(is.na(df$Collection.Date))),
+    as.character(sum(is.na(df$Booklet_parsed))),
+    as.character(sum(is.na(df$MEMs_parsed))),
+    as.character(wake_missing),  # FIXED
+    as.character(sum(is.na(df$Booklet_min))),
+    as.character(sum(is.na(df$MEMs_min))),
+    "",
+    "",
+    as.character(sum(is.na(df$Cortisol))),
+    as.character(sum(is.na(df$DHEA)))
+  ),
+  Complete_N = c(
+    "", "", "", "", "",
+    "",
+    "",
+    as.character(sum(!is.na(df$Collection.Date))),
+    as.character(sum(!is.na(df$Booklet_parsed))),
+    as.character(sum(!is.na(df$MEMs_parsed))),
+    as.character(wake_total - wake_missing),  # FIXED
+    as.character(sum(!is.na(df$Booklet_min))),
+    as.character(sum(!is.na(df$MEMs_min))),
+    "",
+    "",
+    as.character(sum(!is.na(df$Cortisol))),
+    as.character(sum(!is.na(df$DHEA)))
+  ),
+  Missing_Percent = c(
+    "", "", "", "", "",
+    "",
+    "",
+    sprintf("%.1f", 100 * sum(is.na(df$Collection.Date)) / nrow(df)),
+    sprintf("%.1f", 100 * sum(is.na(df$Booklet_parsed)) / nrow(df)),
+    sprintf("%.1f", 100 * sum(is.na(df$MEMs_parsed)) / nrow(df)),
+    sprintf("%.1f", wake_pct),  # FIXED
+    sprintf("%.1f", 100 * sum(is.na(df$Booklet_min)) / nrow(df)),
+    sprintf("%.1f", 100 * sum(is.na(df$MEMs_min)) / nrow(df)),
+    "",
+    "",
+    sprintf("%.1f", 100 * sum(is.na(df$Cortisol)) / nrow(df)),
+    sprintf("%.1f", 100 * sum(is.na(df$DHEA)) / nrow(df))
+  ),
+  stringsAsFactors = FALSE
+)
+
+print(knitr::kable(table0, format = "simple",
+                    col.names = c("Variable", "Total_N", "Missing_N", "Complete_N", "Missing_Percent")))
+
+# Auto-detect anomalies instead of hardcoding
+
+write.csv(table0, "Table0_Study_Overview.csv", row.names = FALSE)
+
+
+
+# QUESTION 1: AGREEMENT
+# Prepare Q1 data: need both Booklet and MEMs times
+df_q1 <- df %>%
+  filter(!is.na(Booklet_min) & !is.na(MEMs_min)) %>%
+  mutate(
+    SubjectID = factor(SubjectID),
+    difference = Booklet_min - MEMs_min,
+    mean_time = (Booklet_min + MEMs_min) / 2
+  )
+
+# Fit linear mixed model: Booklet ~ MEMs + (1|Subject)
+m1 <- lmer(Booklet_min ~ MEMs_min + (1|SubjectID), data = df_q1, REML = TRUE)
+
+beta <- fixef(m1)
+coef_summary <- summary(m1)$coefficients
+
+ci <- confint(m1, method = "Wald", parm = "beta_")
+ci_int <- ci["(Intercept)", ]
+ci_slope <- ci["MEMs_min", ]
+
+# Test if intercept = 0 (perfect agreement would have intercept = 0)
+test_int0 <- lmerTest::contest1D(m1, L = c(1, 0), rhs = 0)
+t_int <- as.numeric(test_int0["t value"])
+p_int <- as.numeric(test_int0["Pr(>|t|)"])
+
+# Test if slope = 1 (perfect agreement would have slope = 1)
+test_slope1 <- lmerTest::contest1D(m1, L = c(0, 1), rhs = 1)
+t_slope1 <- as.numeric(test_slope1["t value"])
+p_slope1 <- as.numeric(test_slope1["Pr(>|t|)"])
+
+# Create results table
+q1_results <- data.frame(
+  Parameter = c("Intercept", "Slope"),
+  Estimate = c(beta["(Intercept)"], beta["MEMs_min"]),
+  SE = c(coef_summary["(Intercept)", "Std. Error"], 
+         coef_summary["MEMs_min", "Std. Error"]),
+  CI_Lower = c(ci_int[1], ci_slope[1]),
+  CI_Upper = c(ci_int[2], ci_slope[2]),
+  Perfect_Agreement = c(0, 1),
+  t_value = c(t_int, t_slope1),
+  p_value = c(p_int, p_slope1),
+  stringsAsFactors = FALSE
+)
+rownames(q1_results) <- NULL
+
+# Calculate Bland-Altman statistics
+mean_diff <- mean(df_q1$difference, na.rm = TRUE)
+sd_diff <- sd(df_q1$difference, na.rm = TRUE)
+loa_upper <- mean_diff + 1.96 * sd_diff  # Upper limit of agreement
+loa_lower <- mean_diff - 1.96 * sd_diff  # Lower limit of agreement
+
+ba_summary <- data.frame(
+  Metric = c("Mean difference (Booklet - MEMs)", 
+             "SD of differences",
+             "95% Limit of Agreement (Lower)", 
+             "95% Limit of Agreement (Upper)"),
+  Value = c(mean_diff, sd_diff, loa_lower, loa_upper)
+)
+
+print(knitr::kable(q1_results, format = "simple", digits = 3))
+print(knitr::kable(ba_summary, format = "simple", digits = 2))
+
+write.csv(q1_results, "Table1_Q1_Agreement.csv", row.names = FALSE)
+write.csv(ba_summary, "Table1b_BlandAltman.csv", row.names = FALSE)
+
+
+
+# QUESTION 2: ADHERENCE
+# Prepare adherence data (only observations with valid MEMs time)
+df_adherence <- df %>%
+  filter(Collection.Sample %in% c(2, 4)) %>%
+  filter(!is.na(MEMs_min)) %>%
+  mutate(
+    # Target times: Sample 2 = 30 min, Sample 4 = 600 min after wake
+    Target_Time = case_when(
+      Collection.Sample == 2 ~ 30,
+      Collection.Sample == 4 ~ 600
+    ),
+    Deviation = MEMs_min - Target_Time,
+    Abs_Deviation = abs(Deviation),
+    Within_7.5min = Abs_Deviation <= 7.5,    # Strict window
+    Within_15min = Abs_Deviation <= 15,      # Loose window
+    Sample_Label = case_when(
+      Collection.Sample == 2 ~ "+30 min",
+      Collection.Sample == 4 ~ "+10 hours"
+    )
+  )
+
+# Calculate adherence with exact binomial confidence intervals
+calc_adherence_with_ci <- function(data, sample_num, window_min) {
+  subset_data <- data %>% filter(Collection.Sample == sample_num)
+  n <- nrow(subset_data)
+  
+  # Count how many are within the time window
+  if (window_min == 7.5) {
+    x <- sum(subset_data$Within_7.5min)
+  } else {
+    x <- sum(subset_data$Within_15min)
+  }
+  
+  # Exact binomial CI
+  ci <- binom.test(x, n, conf.level = 0.95)
+  
+  return(data.frame(
+    Sample = ifelse(sample_num == 2, "+30 min", "+10 hours"),
+    Target_Time = ifelse(sample_num == 2, "30 min", "600 min"),
+    Window = paste0("±", window_min, " min"),
+    N_Total = n,
+    N_Adherent = x,
+    Percentage = round(100 * x / n, 1),
+    CI_Lower = round(100 * ci$conf.int[1], 1),
+    CI_Upper = round(100 * ci$conf.int[2], 1)
+  ))
+}
+
+# Calculate for all combinations: 2 samples × 2 windows = 4 rows
+q2_results <- dplyr::bind_rows(
+  calc_adherence_with_ci(df_adherence, 2, 7.5),
+  calc_adherence_with_ci(df_adherence, 2, 15),
+  calc_adherence_with_ci(df_adherence, 4, 7.5),
+  calc_adherence_with_ci(df_adherence, 4, 15)
+)
+
+print(knitr::kable(q2_results, format = "simple", digits = 1))
+
+write.csv(q2_results, "Table2_Q2_Adherence.csv", row.names = FALSE)
+
+
+
+# QUESTION 3: HORMONE PATTERNS
+# Prepare base Q3 data - require BOTH booklet and cap times
+data_q3 <- df %>%
+  filter(!is.na(Booklet_min) & !is.na(MEMs_min)) %>%  # Both required
+  mutate(
+    booklet = Booklet_min,
+    cap = MEMs_min,
+    
+    # Friend's piecewise variables
+    t1_30 = pmin(cap, 30),
+    t2_30 = pmax(cap - 30, 0),
+    
+    id = factor(SubjectID)
+  )
+
+# Cortisol: Use ALL subjects (including any problem subjects)
+data_q3_cort <- data_q3 %>%
+  filter(!is.na(Cortisol) & Cortisol > 0) %>%
+  mutate(log_cort = log(Cortisol))
+
+# DHEA: EXCLUDE problem subjects (e.g., Subject 3037)
+# This is where we finally remove Subject 3037!
+data_q3_dhea <- data_q3 %>%
+  filter(!is.na(DHEA) & DHEA > 0) %>%
+  filter(!(SubjectID %in% problem_subjects)) %>%  # Exclude here!
+  mutate(log_dhea = log(DHEA))
+
+# Fit piecewise linear mixed models with log-transformed outcomes
+cort_fit_30 <- lmer(log_cort ~ t1_30 + t2_30 + (1 | id), 
+                    data = data_q3_cort, REML = TRUE)
+dhea_fit_30 <- lmer(log_dhea ~ t1_30 + t2_30 + (1 | id), 
+                    data = data_q3_dhea, REML = TRUE)
+
+# Extract summaries
+cort_summary <- summary(cort_fit_30)
+dhea_summary <- summary(dhea_fit_30)
+
+# Calculate ICC (Intraclass Correlation Coefficient)
+# ICC = between-subject variance / total variance
+calc_icc <- function(model) {
+  vc <- as.data.frame(VarCorr(model))
+  var_subject <- vc$vcov[1]
+  var_resid <- vc$vcov[2]
+  icc <- var_subject / (var_subject + var_resid)
+  return(round(100 * icc, 1))
+}
+
+icc_cort <- calc_icc(cort_fit_30)
+icc_dhea <- calc_icc(dhea_fit_30)
+
+# Get variance components
+vc_cort <- as.data.frame(VarCorr(cort_fit_30))
+vc_dhea <- as.data.frame(VarCorr(dhea_fit_30))
+
+# Create results table in side-by-side format
+q3_results <- data.frame(
+  Parameter = c(
+    "Fixed Effects",
+    "  Intercept (at waking)",
+    "  Time1 (0-30 min slope)",
+    "  Time2 (post-30 min slope)",
+    "",
+    "Random Effects",
+    "  Subject variance",
+    "  Residual variance",
+    "  ICC"
+  ),
+  log_Cortisol = c(
+    "",
+    sprintf("%.3f (p %s)", 
+            fixef(cort_fit_30)["(Intercept)"],
+            ifelse(cort_summary$coefficients["(Intercept)", "Pr(>|t|)"] < 0.001, 
+                   "< 0.001",
+                   sprintf("= %.3f", cort_summary$coefficients["(Intercept)", "Pr(>|t|)"]))),
+    sprintf("%.4f (p = %.3f)", 
+            fixef(cort_fit_30)["t1_30"],
+            cort_summary$coefficients["t1_30", "Pr(>|t|)"]),
+    sprintf("%.4f (p %s)", 
+            fixef(cort_fit_30)["t2_30"],
+            ifelse(cort_summary$coefficients["t2_30", "Pr(>|t|)"] < 0.001,
+                   "< 0.001",
+                   sprintf("= %.3f", cort_summary$coefficients["t2_30", "Pr(>|t|)"]))),
+    "",
+    "",
+    sprintf("%.3f", vc_cort$vcov[1]),
+    sprintf("%.3f", vc_cort$vcov[2]),
+    sprintf("%.1f%%", icc_cort)
+  ),
+  log_DHEA = c(
+    "",
+    sprintf("%.3f (p = %.3f)", 
+            fixef(dhea_fit_30)["(Intercept)"],
+            dhea_summary$coefficients["(Intercept)", "Pr(>|t|)"]),
+    sprintf("%.4f (p %s)", 
+            fixef(dhea_fit_30)["t1_30"],
+            ifelse(dhea_summary$coefficients["t1_30", "Pr(>|t|)"] < 0.001,
+                   "< 0.001",
+                   sprintf("= %.3f", dhea_summary$coefficients["t1_30", "Pr(>|t|)"]))),
+    sprintf("%.4f (p %s)", 
+            fixef(dhea_fit_30)["t2_30"],
+            ifelse(dhea_summary$coefficients["t2_30", "Pr(>|t|)"] < 0.001,
+                   "< 0.001",
+                   sprintf("= %.3f", dhea_summary$coefficients["t2_30", "Pr(>|t|)"]))),
+    "",
+    "",
+    sprintf("%.3f", vc_dhea$vcov[1]),
+    sprintf("%.3f", vc_dhea$vcov[2]),
+    sprintf("%.1f%%", icc_dhea)
+  ),
+  stringsAsFactors = FALSE
+)
+
+
+print(knitr::kable(q3_results, format = "simple",
+                    col.names = c("Parameter", "log(Cortisol)", "log(DHEA)")))
+
+write.csv(q3_results, "Table3_Q3_Hormones.csv", row.names = FALSE)
+
+
+# FIGURES
+# Figure 1: Bland-Altman plot
+plot(df_q1$mean_time, df_q1$difference,
+     xlab = "Mean of Booklet and MEMs (minutes)", 
+     ylab = "Difference: Booklet - MEMs (minutes)",
+     main = "Bland-Altman Plot",
+     pch = 16, col = rgb(0, 0, 1, 0.3))
+abline(h = mean_diff, col = "blue", lwd = 2)          # Mean difference
+abline(h = loa_upper, col = "red", lwd = 2, lty = 2)  # Upper LoA
+abline(h = loa_lower, col = "red", lwd = 2, lty = 2)  # Lower LoA
+abline(h = 0, col = "gray", lty = 3)                  # Zero line
+legend("topright",
+       c(sprintf("Mean: %.1f", mean_diff),
+         sprintf("Upper LoA: %.1f", loa_upper),
+         sprintf("Lower LoA: %.1f", loa_lower)),
+       col = c("blue", "red", "red"), lty = c(1, 2, 2), lwd = 2, bty = "n", cex = 0.8)
+
+# Figure 2: Combined Hormone Diurnal Patterns (side by side)
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+
+# Panel A: Cortisol (use MEMs time on x-axis)
+plot(data_q3_cort$cap, data_q3_cort$log_cort,
+     xlab = "MEMs minutes since wake", 
+     ylab = "log(Cortisol) [log(nmol/L)]",
+     main = "A. Cortisol Diurnal Pattern",
+     pch = 16, col = rgb(0, 0, 1, 0.3),
+     xlim = c(0, max(data_q3_cort$cap, na.rm=TRUE)))
+
+# Piecewise fitted line (use cap for prediction)
+time_seq_cort <- seq(0, max(data_q3_cort$cap, na.rm=TRUE), length.out=200)
+pred_cort <- fixef(cort_fit_30)["(Intercept)"] + 
+             fixef(cort_fit_30)["t1_30"] * pmin(time_seq_cort, 30) + 
+             fixef(cort_fit_30)["t2_30"] * pmax(time_seq_cort - 30, 0)
+lines(time_seq_cort, pred_cort, col = "red", lwd = 2)
+abline(v = 30, col = "gray", lty = 2)  # Mark the knot at 30 min
+text(30, par("usr")[4]*0.95, "30 min", col = "gray", pos = 4, cex = 0.8)
+
+# Panel B: DHEA (use MEMs time on x-axis)
+plot(data_q3_dhea$cap, data_q3_dhea$log_dhea,
+     xlab = "MEMs minutes since wake", 
+     ylab = "log(DHEA) [log(nmol/L)]",
+     main = "B. DHEA Diurnal Pattern",
+     pch = 16, col = rgb(0, 0.5, 0, 0.3),
+     xlim = c(0, max(data_q3_dhea$cap, na.rm=TRUE)))
+
+# Piecewise fitted line (use cap for prediction)
+time_seq_dhea <- seq(0, max(data_q3_dhea$cap, na.rm=TRUE), length.out=200)
+pred_dhea <- fixef(dhea_fit_30)["(Intercept)"] + 
+             fixef(dhea_fit_30)["t1_30"] * pmin(time_seq_dhea, 30) + 
+             fixef(dhea_fit_30)["t2_30"] * pmax(time_seq_dhea - 30, 0)
+lines(time_seq_dhea, pred_dhea, col = "red", lwd = 2)
+abline(v = 30, col = "gray", lty = 2)  # Mark the knot at 30 min
+text(30, par("usr")[4]*0.95, "30 min", col = "gray", pos = 4, cex = 0.8)
+```
+```
+
+
+
+
