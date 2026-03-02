@@ -1,0 +1,4 @@
+"Parameter","Estimate","Expected_Perfect_Agreement","Deviation"
+"Intercept",-7.56705561962865,0,-7.56705561962865
+"Slope",0.997009419168041,1,-0.00299058083195924
+"ICC",0.0452918242130175,NA,NA
