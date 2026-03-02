@@ -1,0 +1,1070 @@
+---
+title: "project1"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(broom)
+library(lmtest)
+library(sandwich)
+library(brms)
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Set brms backend if available
+if (requireNamespace("cmdstanr", quietly = TRUE)) {
+  options(brms.backend = "cmdstanr")
+}
+
+
+################################################################################
+# 0 Load data and clean names
+################################################################################
+
+data_file <- "hiv_6624_final.csv"
+
+hiv_data_raw <- read.csv(
+  data_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+nm <- names(hiv_data_raw)
+nm <- trimws(nm)
+bad <- is.na(nm) | nm == ""
+if (any(bad)) nm[bad] <- paste0("x", which(bad))
+nm <- tolower(nm)
+nm <- make.unique(nm, sep = "_")
+names(hiv_data_raw) <- nm
+
+stopifnot(!any(is.na(names(hiv_data_raw))))
+stopifnot(!any(names(hiv_data_raw) == ""))
+stopifnot(!any(duplicated(names(hiv_data_raw))))
+
+
+################################################################################
+# 1 Recode special missing
+################################################################################
+
+recode_special_missing <- function(x) {
+  if (!is.numeric(x)) return(x)
+  x[x %in% c(999, 9999, 999999999)] <- NA
+  x[x %in% c(-1, -8, -9)] <- NA
+  x
+}
+
+hiv_data <- hiv_data_raw %>%
+  mutate(across(everything(), recode_special_missing))
+
+
+################################################################################
+# 2 Required variables check
+################################################################################
+
+required_vars <- c(
+  "newid","years","hivpos","everart","hard_drugs",
+  "vload","leu3n","agg_phys","agg_ment",
+  "age","race","educbas","bmi","smoke","adh"
+)
+
+missing_vars <- setdiff(required_vars, names(hiv_data))
+if (length(missing_vars) > 0) {
+  print(missing_vars)
+  stop("Some required variables are missing from the file.")
+}
+
+
+################################################################################
+# 3 Eligible cohort
+################################################################################
+
+eligible_ids <- hiv_data %>%
+  group_by(newid) %>%
+  summarise(
+    hiv_positive = any(hivpos == 1, na.rm = TRUE),
+    ever_on_art  = any(everart == 1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(hiv_positive, ever_on_art) %>%
+  pull(newid)
+
+hiv_elig <- hiv_data %>%
+  filter(newid %in% eligible_ids)
+
+
+################################################################################
+# 4 Create baseline and year 2 wide dataset
+################################################################################
+
+baseline <- hiv_elig %>%
+  filter(years == 0) %>%
+  arrange(newid) %>%
+  group_by(newid) %>%
+  slice(1) %>%
+  ungroup()
+
+stopifnot("newid" %in% names(baseline))
+
+year2 <- hiv_elig %>%
+  filter(years == 2) %>%
+  arrange(newid) %>%
+  group_by(newid) %>%
+  slice(1) %>%
+  ungroup()
+
+stopifnot("newid" %in% names(year2))
+
+baseline_keep <- baseline %>%
+  transmute(
+    newid,
+    hard_drugs0 = hard_drugs,
+    age0  = age,
+    race0 = race,
+    educ0 = educbas,
+    bmi0  = bmi,
+    smoke0 = smoke,
+    vload0 = vload,
+    cd40   = leu3n,
+    phys0  = agg_phys,
+    ment0  = agg_ment
+  )
+
+year2_keep <- year2 %>%
+  transmute(
+    newid,
+    adh2   = adh,
+    vload2 = vload,
+    cd42   = leu3n,
+    phys2  = agg_phys,
+    ment2  = agg_ment
+  )
+
+analysis_df <- year2_keep %>%
+  left_join(baseline_keep, by = "newid") %>%
+  mutate(
+    log_vload0 = log10(vload0 + 1),
+    log_vload2 = log10(vload2 + 1),
+    hard_drugs0 = as.integer(hard_drugs0),
+    hard_drug_group = factor(
+      hard_drugs0,
+      levels = c(0, 1),
+      labels = c("Non user", "Hard drug user")
+    ),
+    race_white = case_when(
+      race0 == 1 ~ "White non Hispanic",
+      is.na(race0) ~ NA_character_,
+      TRUE ~ "Non White"
+    ) %>% factor(),
+    educ_college = case_when(
+      educ0 %in% c(1, 2, 3, 4) ~ "Below college degree",
+      educ0 %in% c(5, 6, 7) ~ "College degree or higher",
+      is.na(educ0) ~ NA_character_
+    ) %>% factor(),
+    
+    # Collapse smoking: Never vs Ever
+    smoke_collapsed = case_when(
+      smoke0 == 1 ~ "Never smoker",
+      smoke0 %in% c(2, 3) ~ "Ever smoker",
+      is.na(smoke0) ~ NA_character_
+    ) %>% factor() %>% relevel(ref = "Never smoker"),
+    
+    # Collapse adherence: >=95% vs <95%
+    adh2_collapsed = case_when(
+      adh2 %in% c(1, 2) ~ ">=95%",
+      adh2 %in% c(3, 4) ~ "<95%",
+      is.na(adh2) ~ NA_character_
+    ) %>% factor() %>% relevel(ref = ">=95%")
+  )
+
+stopifnot(all(analysis_df$race0 %in% c(1:8, NA)))
+
+
+################################################################################
+# 5 Define CD4 outlier threshold using IQR method
+################################################################################
+
+cd4_stats <- analysis_df %>%
+  summarise(
+    q25 = quantile(cd42, 0.25, na.rm = TRUE),
+    q75 = quantile(cd42, 0.75, na.rm = TRUE),
+    iqr = q75 - q25,
+    upper_fence = q75 + 1.5 * iqr,
+    max_cd4 = max(cd42, na.rm = TRUE)
+  )
+
+cd4_upper_fence <- cd4_stats$upper_fence
+
+
+################################################################################
+# 6 Build main analysis sample (with CD4 outlier exclusion)
+################################################################################
+
+df_final <- analysis_df %>%
+  filter(
+    !is.na(hard_drugs0),
+    !is.na(age0),
+    !is.na(race_white),
+    !is.na(educ_college),
+    !is.na(bmi0),
+    !is.na(smoke_collapsed),
+    !is.na(adh2_collapsed),
+    !is.na(log_vload0), !is.na(log_vload2),
+    !is.na(cd40), !is.na(cd42),
+    cd42 < 1700,
+    !is.na(phys0), !is.na(phys2),
+    !is.na(ment0), !is.na(ment2)
+  )
+
+
+################################################################################
+# 7 Sensitivity analysis sample (without CD4 outlier exclusion)
+################################################################################
+
+df_sensitivity <- analysis_df %>%
+  filter(
+    !is.na(hard_drugs0),
+    !is.na(age0),
+    !is.na(race_white),
+    !is.na(educ_college),
+    !is.na(bmi0),
+    !is.na(smoke_collapsed),
+    !is.na(adh2_collapsed),
+    !is.na(log_vload0), !is.na(log_vload2),
+    !is.na(cd40), !is.na(cd42),
+    !is.na(phys0), !is.na(phys2),
+    !is.na(ment0), !is.na(ment2)
+  )
+
+
+################################################################################
+# 8 Sample size tracking table
+################################################################################
+
+sample_table <- tibble(
+  stage = c(
+    "Original cohort",
+    "Eligible cohort HIV+ and ever ART",
+    "Has year 0 record",
+    "Has year 2 record",
+    "Has both year 0 and year 2",
+    "Complete covariates and outcomes",
+    "Main analysis (exclude CD4 outlier)",
+    "Sensitivity analysis (include all)"
+  ),
+  N_subjects = c(
+    n_distinct(hiv_data$newid),
+    n_distinct(hiv_elig$newid),
+    n_distinct(baseline$newid),
+    n_distinct(year2$newid),
+    n_distinct(intersect(baseline$newid, year2$newid)),
+    n_distinct(df_sensitivity$newid),
+    n_distinct(df_final$newid),
+    n_distinct(df_sensitivity$newid)
+  )
+)
+
+sample_table %>% kable() %>% kable_styling(full_width = FALSE)
+
+
+################################################################################
+# 9 Dropout analysis
+################################################################################
+
+dropout_check <- baseline %>%
+  mutate(
+    has_year2 = newid %in% year2$newid
+  ) %>%
+  group_by(has_year2) %>%
+  summarise(
+    n = n(),
+    vload_mean = mean(vload, na.rm = TRUE),
+    vload_sd = sd(vload, na.rm = TRUE),
+    cd4_mean = mean(leu3n, na.rm = TRUE),
+    cd4_sd = sd(leu3n, na.rm = TRUE),
+    hard_drug_pct = mean(hard_drugs == 1, na.rm = TRUE) * 100,
+    age_mean = mean(age, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+dropout_check %>% kable(digits = 2) %>% kable_styling(full_width = FALSE)
+
+
+################################################################################
+# 10 Baseline descriptive table by hard drug group
+################################################################################
+
+baseline_desc <- df_final %>%
+  group_by(hard_drug_group) %>%
+  summarise(
+    n = n(),
+    age_mean = mean(age0, na.rm = TRUE),
+    age_sd = sd(age0, na.rm = TRUE),
+    bmi_mean = mean(bmi0, na.rm = TRUE),
+    bmi_sd = sd(bmi0, na.rm = TRUE),
+    logv0_mean = mean(log_vload0, na.rm = TRUE),
+    logv0_sd = sd(log_vload0, na.rm = TRUE),
+    cd40_mean = mean(cd40, na.rm = TRUE),
+    cd40_sd = sd(cd40, na.rm = TRUE),
+    phys0_mean = mean(phys0, na.rm = TRUE),
+    phys0_sd = sd(phys0, na.rm = TRUE),
+    ment0_mean = mean(ment0, na.rm = TRUE),
+    ment0_sd = sd(ment0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+baseline_race <- df_final %>%
+  count(hard_drug_group, race_white) %>%
+  group_by(hard_drug_group) %>%
+  mutate(pct = n / sum(n)) %>%
+  ungroup()
+
+baseline_smoke <- df_final %>%
+  count(hard_drug_group, smoke_collapsed) %>%
+  group_by(hard_drug_group) %>%
+  mutate(pct = n / sum(n)) %>%
+  ungroup()
+
+baseline_educ <- df_final %>%
+  count(hard_drug_group, educ_college) %>%
+  group_by(hard_drug_group) %>%
+  mutate(pct = n / sum(n)) %>%
+  ungroup()
+
+baseline_adh <- df_final %>%
+  count(hard_drug_group, adh2_collapsed) %>%
+  group_by(hard_drug_group) %>%
+  mutate(pct = n / sum(n)) %>%
+  ungroup()
+
+baseline_desc %>% kable(digits = 2) %>% kable_styling(full_width = FALSE)
+baseline_race %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+baseline_smoke %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+baseline_educ %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+baseline_adh %>% kable(digits = 3) %>% kable_styling(full_width = FALSE)
+
+
+################################################################################
+# 11 Main analysis: Fit four linear models
+################################################################################
+
+fit_vload <- lm(
+  log_vload2 ~ hard_drug_group + log_vload0 + age0 + race_white + bmi0 + smoke_collapsed + educ_college + adh2_collapsed,
+  data = df_final
+)
+
+fit_cd4 <- lm(
+  cd42 ~ hard_drug_group + cd40 + age0 + race_white + bmi0 + smoke_collapsed + educ_college + adh2_collapsed,
+  data = df_final
+)
+
+fit_phys <- lm(
+  phys2 ~ hard_drug_group + phys0 + age0 + race_white + bmi0 + smoke_collapsed + educ_college + adh2_collapsed,
+  data = df_final
+)
+
+fit_ment <- lm(
+  ment2 ~ hard_drug_group + ment0 + age0 + race_white + bmi0 + smoke_collapsed + educ_college + adh2_collapsed,
+  data = df_final
+)
+
+
+################################################################################
+# 12 Robust SE tables
+################################################################################
+
+robust_table <- function(fit) {
+  ct <- coeftest(fit, vcov. = vcovHC(fit, type = "HC3"))
+  tibble(
+    term = rownames(ct),
+    estimate = ct[, 1],
+    robust_se = ct[, 2],
+    t_value = ct[, 3],
+    p_value = ct[, 4]
+  )
+}
+
+robust_vload <- robust_table(fit_vload)
+robust_cd4 <- robust_table(fit_cd4)
+robust_phys <- robust_table(fit_phys)
+robust_ment <- robust_table(fit_ment)
+
+robust_vload %>% kable(digits = 4) %>% kable_styling(full_width = FALSE)
+robust_cd4 %>% kable(digits = 4) %>% kable_styling(full_width = FALSE)
+robust_phys %>% kable(digits = 4) %>% kable_styling(full_width = FALSE)
+robust_ment %>% kable(digits = 4) %>% kable_styling(full_width = FALSE)
+
+
+################################################################################
+# 13 Sensitivity analysis: CD4 model without outlier exclusion
+################################################################################
+
+fit_cd4_sensitivity <- lm(
+  cd42 ~ hard_drug_group + cd40 + age0 + race_white + bmi0 + smoke_collapsed + educ_college + adh2_collapsed,
+  data = df_sensitivity
+)
+
+robust_cd4_sensitivity <- robust_table(fit_cd4_sensitivity)
+
+robust_cd4_sensitivity %>% kable(digits = 4) %>% kable_styling(full_width = FALSE)
+
+sensitivity_comparison <- tibble(
+  analysis = c("Main (n=463, exclude CD4 outlier)", 
+               "Sensitivity (n=464, include all)"),
+  hard_drug_coef = c(
+    coef(fit_cd4)["hard_drug_groupHard drug user"],
+    coef(fit_cd4_sensitivity)["hard_drug_groupHard drug user"]
+  ),
+  hard_drug_se = c(
+    robust_cd4$robust_se[robust_cd4$term == "hard_drug_groupHard drug user"],
+    robust_cd4_sensitivity$robust_se[robust_cd4_sensitivity$term == "hard_drug_groupHard drug user"]
+  ),
+  hard_drug_p = c(
+    robust_cd4$p_value[robust_cd4$term == "hard_drug_groupHard drug user"],
+    robust_cd4_sensitivity$p_value[robust_cd4_sensitivity$term == "hard_drug_groupHard drug user"]
+  )
+)
+
+sensitivity_comparison %>% kable(digits = 4) %>% kable_styling(full_width = FALSE)
+
+
+################################################################################
+# 14 Mediation analysis: Models without adherence
+################################################################################
+
+fit_vload_no_adh <- lm(
+  log_vload2 ~ hard_drug_group + log_vload0 + age0 + race_white + bmi0 + smoke_collapsed + educ_college,
+  data = df_final
+)
+
+fit_cd4_no_adh <- lm(
+  cd42 ~ hard_drug_group + cd40 + age0 + race_white + bmi0 + smoke_collapsed + educ_college,
+  data = df_final
+)
+
+fit_phys_no_adh <- lm(
+  phys2 ~ hard_drug_group + phys0 + age0 + race_white + bmi0 + smoke_collapsed + educ_college,
+  data = df_final
+)
+
+fit_ment_no_adh <- lm(
+  ment2 ~ hard_drug_group + ment0 + age0 + race_white + bmi0 + smoke_collapsed + educ_college,
+  data = df_final
+)
+
+robust_vload_no_adh <- robust_table(fit_vload_no_adh)
+robust_cd4_no_adh <- robust_table(fit_cd4_no_adh)
+robust_phys_no_adh <- robust_table(fit_phys_no_adh)
+robust_ment_no_adh <- robust_table(fit_ment_no_adh)
+
+mediation_comparison <- tibble(
+  outcome = c("VLOAD", "CD4", "PHYS", "MENT"),
+  coef_with_adh = c(
+    coef(fit_vload)["hard_drug_groupHard drug user"],
+    coef(fit_cd4)["hard_drug_groupHard drug user"],
+    coef(fit_phys)["hard_drug_groupHard drug user"],
+    coef(fit_ment)["hard_drug_groupHard drug user"]
+  ),
+  coef_without_adh = c(
+    coef(fit_vload_no_adh)["hard_drug_groupHard drug user"],
+    coef(fit_cd4_no_adh)["hard_drug_groupHard drug user"],
+    coef(fit_phys_no_adh)["hard_drug_groupHard drug user"],
+    coef(fit_ment_no_adh)["hard_drug_groupHard drug user"]
+  ),
+  pct_change = (coef_without_adh - coef_with_adh) / abs(coef_without_adh) * 100
+)
+
+mediation_comparison %>% kable(digits = 4) %>% kable_styling(full_width = FALSE)
+
+
+################################################################################
+# 15 Bayesian models - FIXED: Using default (flat) priors
+################################################################################
+
+# Use default priors (flat/uninformative) to let data dominate
+bfit_vload <- brm(
+  log_vload2 ~ hard_drug_group + log_vload0 + age0 + race_white + bmi0 + smoke_collapsed + educ_college + adh2_collapsed,
+  data = df_final,
+  family = gaussian(),
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  seed = 1
+)
+
+bfit_cd4 <- brm(
+  cd42 ~ hard_drug_group + cd40 + age0 + race_white + bmi0 + smoke_collapsed + educ_college + adh2_collapsed,
+  data = df_final,
+  family = gaussian(),
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  seed = 1
+)
+
+bfit_phys <- brm(
+  phys2 ~ hard_drug_group + phys0 + age0 + race_white + bmi0 + smoke_collapsed + educ_college + adh2_collapsed,
+  data = df_final,
+  family = gaussian(),
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  seed = 1
+)
+
+bfit_ment <- brm(
+  ment2 ~ hard_drug_group + ment0 + age0 + race_white + bmi0 + smoke_collapsed + educ_college + adh2_collapsed,
+  data = df_final,
+  family = gaussian(),
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  seed = 1
+)
+
+
+################################################################################
+# 16 Model comparison: Frequentist vs Bayesian
+################################################################################
+
+extract_harddrug <- function(bfit) {
+  s <- posterior_summary(bfit)
+  rn <- rownames(s)
+  
+  term <- rn[str_detect(rn, "b_hard_drug_groupHarddruguser")]
+  
+  if (length(term) == 0) {
+    warning("No matching term found!")
+    return(tibble(term = NA_character_, estimate = NA_real_, q025 = NA_real_, q975 = NA_real_))
+  }
+  
+  tibble(
+    term = term,
+    estimate = s[term, "Estimate"],
+    q025 = s[term, "Q2.5"],
+    q975 = s[term, "Q97.5"]
+  )
+}
+
+bayesian_results <- bind_rows(
+  VLOAD = extract_harddrug(bfit_vload),
+  CD4   = extract_harddrug(bfit_cd4),
+  PHYS  = extract_harddrug(bfit_phys),
+  MENT  = extract_harddrug(bfit_ment),
+  .id = "outcome"
+)
+
+bayesian_results %>% kable(digits = 4) %>% kable_styling(full_width = FALSE)
+
+comparison_table <- tibble(
+  outcome = c("VLOAD", "CD4", "PHYS", "MENT"),
+  freq_estimate = c(
+    coef(fit_vload)["hard_drug_groupHard drug user"],
+    coef(fit_cd4)["hard_drug_groupHard drug user"],
+    coef(fit_phys)["hard_drug_groupHard drug user"],
+    coef(fit_ment)["hard_drug_groupHard drug user"]
+  ),
+  freq_se = c(
+    robust_vload$robust_se[robust_vload$term == "hard_drug_groupHard drug user"],
+    robust_cd4$robust_se[robust_cd4$term == "hard_drug_groupHard drug user"],
+    robust_phys$robust_se[robust_phys$term == "hard_drug_groupHard drug user"],
+    robust_ment$robust_se[robust_ment$term == "hard_drug_groupHard drug user"]
+  ),
+  freq_pvalue = c(
+    robust_vload$p_value[robust_vload$term == "hard_drug_groupHard drug user"],
+    robust_cd4$p_value[robust_cd4$term == "hard_drug_groupHard drug user"],
+    robust_phys$p_value[robust_phys$term == "hard_drug_groupHard drug user"],
+    robust_ment$p_value[robust_ment$term == "hard_drug_groupHard drug user"]
+  )
+)
+
+comparison_table <- comparison_table %>%
+  left_join(
+    bayesian_results %>% select(outcome, bayes_estimate = estimate, bayes_q025 = q025, bayes_q975 = q975),
+    by = "outcome"
+  ) %>%
+  mutate(
+    freq_ci_lower = freq_estimate - 1.96 * freq_se,
+    freq_ci_upper = freq_estimate + 1.96 * freq_se,
+    freq_sig = ifelse(freq_pvalue < 0.05, "Yes", "No"),
+    bayes_sig = ifelse(bayes_q025 * bayes_q975 > 0, "Yes", "No")
+  )
+
+comparison_table %>%
+  select(outcome, freq_estimate, freq_ci_lower, freq_ci_upper, freq_pvalue,
+         bayes_estimate, bayes_q025, bayes_q975) %>%
+  kable(digits = 3) %>%
+  kable_styling(full_width = FALSE)
+
+
+################################################################################
+# 17 WAIC comparison for adherence models - FIXED: Using default priors
+################################################################################
+
+bfit_vload_no_adh <- brm(
+  log_vload2 ~ hard_drug_group + log_vload0 + age0 + race_white + bmi0 + smoke_collapsed + educ_college,
+  data = df_final,
+  family = gaussian(),
+  chains = 4, cores = 4, iter = 2000, seed = 1
+)
+
+bfit_cd4_no_adh <- brm(
+  cd42 ~ hard_drug_group + cd40 + age0 + race_white + bmi0 + smoke_collapsed + educ_college,
+  data = df_final,
+  family = gaussian(),
+  chains = 4, cores = 4, iter = 2000, seed = 1
+)
+
+bfit_phys_no_adh <- brm(
+  phys2 ~ hard_drug_group + phys0 + age0 + race_white + bmi0 + smoke_collapsed + educ_college,
+  data = df_final,
+  family = gaussian(),
+  chains = 4, cores = 4, iter = 2000, seed = 1
+)
+
+bfit_ment_no_adh <- brm(
+  ment2 ~ hard_drug_group + ment0 + age0 + race_white + bmi0 + smoke_collapsed + educ_college,
+  data = df_final,
+  family = gaussian(),
+  chains = 4, cores = 4, iter = 2000, seed = 1
+)
+
+waic_vload_with <- waic(bfit_vload)
+waic_vload_without <- waic(bfit_vload_no_adh)
+waic_cd4_with <- waic(bfit_cd4)
+waic_cd4_without <- waic(bfit_cd4_no_adh)
+waic_phys_with <- waic(bfit_phys)
+waic_phys_without <- waic(bfit_phys_no_adh)
+waic_ment_with <- waic(bfit_ment)
+waic_ment_without <- waic(bfit_ment_no_adh)
+
+waic_comparison <- tibble(
+  outcome = c("VLOAD", "CD4", "PHYS", "MENT"),
+  waic_with_adh = c(
+    waic_vload_with$estimates["waic", "Estimate"],
+    waic_cd4_with$estimates["waic", "Estimate"],
+    waic_phys_with$estimates["waic", "Estimate"],
+    waic_ment_with$estimates["waic", "Estimate"]
+  ),
+  waic_without_adh = c(
+    waic_vload_without$estimates["waic", "Estimate"],
+    waic_cd4_without$estimates["waic", "Estimate"],
+    waic_phys_without$estimates["waic", "Estimate"],
+    waic_ment_without$estimates["waic", "Estimate"]
+  ),
+  waic_diff = waic_without_adh - waic_with_adh,
+  better_model = ifelse(waic_diff > 0, "With adherence", "Without adherence")
+)
+
+waic_comparison %>%
+  kable(digits = 2) %>%
+  kable_styling(full_width = FALSE)
+
+
+################################################################################
+# 18 Summary of findings
+################################################################################
+
+sig_results <- comparison_table %>%
+  filter(freq_sig == "Yes" | bayes_sig == "Yes") %>%
+  select(outcome, freq_estimate, freq_pvalue, bayes_estimate)
+
+if (nrow(sig_results) > 0) {
+  sig_results %>% kable(digits = 4) %>% kable_styling(full_width = FALSE)
+}
+
+nonsig_results <- comparison_table %>%
+  filter(freq_sig == "No" & bayes_sig == "No") %>%
+  select(outcome, freq_estimate, freq_pvalue, bayes_estimate)
+
+if (nrow(nonsig_results) > 0) {
+  nonsig_results %>% kable(digits = 4) %>% kable_styling(full_width = FALSE)
+}
+
+mediation_summary <- mediation_comparison %>%
+  mutate(
+    mediated = ifelse(abs(pct_change) > 10, "Yes (>10% change)", "No (<10% change)")
+  ) %>%
+  select(outcome, coef_without_adh, coef_with_adh, pct_change, mediated)
+
+mediation_summary %>% kable(digits = 4) %>% kable_styling(full_width = FALSE)
+
+waic_comparison %>% 
+  select(outcome, waic_diff, better_model) %>%
+  kable(digits = 2) %>%
+  kable_styling(full_width = FALSE)
+
+consistency_check <- comparison_table %>%
+  mutate(
+    diff = abs(freq_estimate - bayes_estimate),
+    consistent = ifelse(diff < 0.5, "Consistent", "Check difference")
+  ) %>%
+  select(outcome, freq_estimate, bayes_estimate, diff, consistent)
+
+consistency_check %>% kable(digits = 4) %>% kable_styling(full_width = FALSE)
+
+# table
+# Sample Table
+simple_sample_table <- tibble(
+  Stage = c(
+    "Original cohort",
+    "HIV-positive and ever on ART",
+    "Has baseline and 2-year follow-up",
+    "Complete data on all variables",
+    "Final analytic sample"
+  ),
+  N = c(715, 669, 506, 464, 463)
+)
+
+simple_sample_table %>%
+  kable(
+    caption = "Table 1. Sample Selection",
+    align = c("l", "r")
+  ) %>%
+  kable_styling(full_width = FALSE, position = "left") %>%
+  footnote(
+    general = "One participant excluded due to extreme CD4 value."
+  )
+
+
+
+# TABLE 2: Baseline Characteristics 
+phys0_stats <- df_final %>%
+  group_by(hard_drug_group) %>%
+  summarise(
+    mean = mean(phys0, na.rm = TRUE),
+    sd = sd(phys0, na.rm = TRUE)
+  )
+
+ment0_stats <- df_final %>%
+  group_by(hard_drug_group) %>%
+  summarise(
+    mean = mean(ment0, na.rm = TRUE),
+    sd = sd(ment0, na.rm = TRUE)
+  )
+
+
+baseline_table <- tibble(
+  Characteristic = c(
+    "N",
+    "Age, years",
+    "BMI, kg/m²",
+    "Viral load, log₁₀ copies/mL",
+    "CD4 count, cells/μL",
+    "Physical QoL score",
+    "Mental QoL score",
+    "Race/ethnicity",
+    "  White, non-Hispanic",
+    "  Non-White",
+    "Smoking status",
+    "  Never smoker",
+    "  Ever smoker",
+    "Education",
+    "  Below college degree",
+    "  College degree or higher",
+    "Medication adherence ≥95%"
+  ),
+  Non_user = c(
+    "427",
+    "43.1 (8.7)",
+    "26.5 (24.1)",
+    "4.5 (0.9)",
+    "374.3 (202.3)",
+    paste0(sprintf("%.1f", phys0_stats$mean[1]), " (", sprintf("%.1f", phys0_stats$sd[1]), ")"),
+    paste0(sprintf("%.1f", ment0_stats$mean[1]), " (", sprintf("%.1f", ment0_stats$sd[1]), ")"),
+    "",
+    "276 (64.6%)",
+    "151 (35.4%)",
+    "",
+    "136 (31.9%)",
+    "291 (68.1%)",
+    "",
+    "237 (55.5%)",
+    "190 (44.5%)",
+    "382 (89.5%)"
+  ),
+  Hard_drug_user = c(
+    "36",
+    "43.9 (9.5)",
+    "23.6 (3.5)",
+    "4.6 (0.9)",
+    "360.0 (200.8)",
+    paste0(sprintf("%.1f", phys0_stats$mean[2]), " (", sprintf("%.1f", phys0_stats$sd[2]), ")"),
+    paste0(sprintf("%.1f", ment0_stats$mean[2]), " (", sprintf("%.1f", ment0_stats$sd[2]), ")"),
+    "",
+    "19 (52.8%)",
+    "17 (47.2%)",
+    "",
+    "0 (0%)",
+    "36 (100%)",
+    "",
+    "26 (72.2%)",
+    "10 (27.8%)",
+    "35 (97.2%)"
+  )
+)
+
+baseline_table %>%
+  kable(
+    caption = "Table 2. Baseline Characteristics by Hard Drug Use Status",
+    col.names = c("Characteristic", "Non-user (n=427)", "Hard drug user (n=36)")
+  ) %>%
+  kable_styling(full_width = FALSE) %>%
+  pack_rows("Continuous variables, mean (SD)", 2, 7) %>%
+  pack_rows("Categorical variables, n (%)", 8, 16) %>%
+  footnote(general = "Continuous variables presented as mean (SD); categorical variables as n (%).")
+
+
+
+
+format_freq_coef <- function(est, se, p) {
+  ci_lower <- est - 1.96 * se
+  ci_upper <- est + 1.96 * se
+  
+  if (p < 0.001) {
+    sprintf("%.3f (%.3f, %.3f), p<0.001", est, ci_lower, ci_upper)
+  } else {
+    sprintf("%.3f (%.3f, %.3f), p=%.3f", est, ci_lower, ci_upper, p)
+  }
+}
+
+format_bayes_coef <- function(est, q025, q975) {
+  sprintf("%.3f (%.3f, %.3f)", est, q025, q975)
+}
+
+
+################################################################################
+# Table 3a: Frequentist
+################################################################################
+
+create_freq_wide_table <- function() {
+  
+  # Extract coefficients from one model
+  extract_one_model <- function(robust_tbl, col_name) {
+    robust_tbl %>%
+      mutate(
+        formatted = pmap_chr(
+          list(estimate, robust_se, p_value),
+          format_freq_coef
+        )
+      ) %>%
+      select(term, formatted) %>%
+      rename(!!col_name := formatted)
+  }
+  
+  # Extract all 4 models
+  vload_coefs <- extract_one_model(robust_vload, "vload")
+  cd4_coefs <- extract_one_model(robust_cd4, "cd4")
+  phys_coefs <- extract_one_model(robust_phys, "phys")
+  ment_coefs <- extract_one_model(robust_ment, "ment")
+  
+  # Merge
+  result <- vload_coefs %>%
+    full_join(cd4_coefs, by = "term") %>%
+    full_join(phys_coefs, by = "term") %>%
+    full_join(ment_coefs, by = "term")
+  
+  result <- result %>%
+    filter(!term %in% c("log_vload0", "cd40", "phys0", "ment0"))
+  
+  result <- result %>%
+    mutate(
+      Variable = case_when(
+        term == "(Intercept)" ~ "Intercept",
+        term == "hard_drug_groupHard drug user" ~ "Hard Drug Use (Yes vs. No)",
+        term == "age0" ~ "Age",
+        term == "race_whiteWhite non Hispanic" ~ "Race (Other vs. Non-Hispanic White)",
+        term == "educ_collegeCollege degree or higher" ~ "Education (College+ vs. Below)",
+        term == "bmi0" ~ "BMI",
+        term == "smoke_collapsedEver smoker" ~ "Smoking (Current vs. Non/Former)",
+        term == "adh2_collapsed<95%" ~ "Adherence (<95% vs. ≥95%)",
+        TRUE ~ term
+      )
+    ) %>%
+    select(Variable, vload, cd4, phys, ment)
+  
+  # Reorder
+  var_order <- c(
+    "Intercept",
+    "Hard Drug Use (Yes vs. No)",
+    "Age",
+    "Race (Other vs. Non-Hispanic White)",
+    "Education (College+ vs. Below)",
+    "BMI",
+    "Smoking (Current vs. Non/Former)",
+    "Adherence (<95% vs. ≥95%)"
+  )
+  
+  result <- result %>%
+    mutate(Variable = factor(Variable, levels = var_order)) %>%
+    arrange(Variable) %>%
+    mutate(Variable = as.character(Variable))
+  
+  return(result)
+}
+
+table3a <- create_freq_wide_table()
+
+table3a_output <- table3a %>%
+  kable(
+    caption = "Table 3a. Frequentist Adjusted Model: All Covariate Effects Across Outcomes",
+    col.names = c("Variable", "Change in Log10 Viral Load", "Change in CD4+ T Cell Count", 
+                  "Change in Physical QoL", "Change in Mental QoL"),
+    align = c("l", "c", "c", "c", "c"),
+    booktabs = TRUE
+  ) %>%
+  kable_styling(full_width = TRUE, font_size = 9) %>%
+  footnote(
+    general = c(
+      "Note: Values shown as estimate (95% CI), p-value.",
+      "Model: outcome ~ hard drug use + baseline outcome + age + race + education + BMI + smoking + adherence.",
+      "Each model adjusted for the corresponding baseline outcome (baseline coefficients not shown).",
+      "Outcomes modeled as Year 2 values adjusted for baseline. Viral load modeled on the log10 scale."
+    ),
+    footnote_as_chunk = TRUE
+  )
+
+print(table3a_output)
+
+
+
+# Table 3b: Bayesian
+
+extract_bayes_coefs <- function(bfit, col_name) {
+  s <- posterior_summary(bfit)
+  beta_names <- rownames(s)[str_detect(rownames(s), "^b_")]
+  
+  tibble(
+    term = beta_names,
+    estimate = s[beta_names, "Estimate"],
+    q025 = s[beta_names, "Q2.5"],
+    q975 = s[beta_names, "Q97.5"]
+  ) %>%
+    mutate(
+      formatted = pmap_chr(list(estimate, q025, q975), format_bayes_coef)
+    ) %>%
+    select(term, formatted) %>%
+    rename(!!col_name := formatted)
+}
+
+create_bayes_wide_table <- function() {
+  
+  # Extract from all 4 models
+  vload_coefs <- extract_bayes_coefs(bfit_vload, "vload")
+  cd4_coefs <- extract_bayes_coefs(bfit_cd4, "cd4")
+  phys_coefs <- extract_bayes_coefs(bfit_phys, "phys")
+  ment_coefs <- extract_bayes_coefs(bfit_ment, "ment")
+  
+  # Merge
+  result <- vload_coefs %>%
+    full_join(cd4_coefs, by = "term") %>%
+    full_join(phys_coefs, by = "term") %>%
+    full_join(ment_coefs, by = "term")
+  
+  result <- result %>%
+    filter(!str_detect(term, "log_vload0|^b_cd40$|^b_phys0$|^b_ment0$"))
+  
+  result <- result %>%
+    mutate(
+      Variable = case_when(
+        str_detect(term, "b_Intercept") ~ "Intercept",
+        str_detect(term, "hard_drug_groupHarddruguser") ~ "Hard Drug Use (Yes vs. No)",
+        str_detect(term, "\\bage0\\b") ~ "Age",
+        str_detect(term, "race_white") ~ "Race (Other vs. Non-Hispanic White)",
+        str_detect(term, "educ_college") ~ "Education (College+ vs. Below)",
+        str_detect(term, "\\bbmi0\\b") ~ "BMI",
+        str_detect(term, "smoke_collapsed") ~ "Smoking (Current vs. Non/Former)",
+        str_detect(term, "adh2_collapsed") ~ "Adherence (<95% vs. ≥95%)",
+        TRUE ~ term
+      )
+    ) %>%
+    select(Variable, vload, cd4, phys, ment)
+  
+  # Reorder
+  var_order <- c(
+    "Intercept",
+    "Hard Drug Use (Yes vs. No)",
+    "Age",
+    "Race (Other vs. Non-Hispanic White)",
+    "Education (College+ vs. Below)",
+    "BMI",
+    "Smoking (Current vs. Non/Former)",
+    "Adherence (<95% vs. ≥95%)"
+  )
+  
+  result <- result %>%
+    mutate(Variable = factor(Variable, levels = var_order)) %>%
+    arrange(Variable) %>%
+    mutate(Variable = as.character(Variable))
+  
+  return(result)
+}
+
+table3b <- create_bayes_wide_table()
+
+table3b_output <- table3b %>%
+  kable(
+    caption = "Table 3b. Bayesian Adjusted Model: All Covariate Effects Across Outcomes",
+    col.names = c("Variable", "Change in Log10 Viral Load", "Change in CD4+ T Cell Count", 
+                  "Change in Physical QoL", "Change in Mental QoL"),
+    align = c("l", "c", "c", "c", "c"),
+    booktabs = TRUE
+  ) %>%
+  kable_styling(full_width = TRUE, font_size = 9) %>%
+  footnote(
+    general = c(
+      "Note: Values shown as posterior mean (95% credible interval).",
+      "Model: outcome ~ hard drug use + baseline outcome + age + race + education + BMI + smoking + adherence.",
+      "Each model adjusted for the corresponding baseline outcome (baseline coefficients not shown).",
+      "Priors: default (uninformative) priors used.",
+      "Outcomes modeled as Year 2 values adjusted for baseline. Viral load modeled on the log10 scale."
+    ),
+    footnote_as_chunk = TRUE
+  )
+
+print(table3b_output)
+
+
+# SUPPLEMENTARY TABLE S1: Mediation
+
+mediation_comparison %>%
+  mutate(
+    Outcome = c("Viral load", "CD4 count", "Physical QoL", "Mental QoL"),
+    Interpretation = ifelse(abs(pct_change) > 10, "Possible mediation", "No mediation")
+  ) %>%
+  select(Outcome, coef_without_adh, coef_with_adh, pct_change, Interpretation) %>%
+  kable(
+    caption = "Supplementary Table S1. Mediation Analysis",
+    digits = 2,
+    col.names = c("Outcome", "Without Adherence", "With Adherence", "% Change", "Interpretation")
+  ) %>%
+  kable_styling(full_width = FALSE) %>%
+  footnote(general = "% Change = [(β with - β without) / |β without|] × 100. Mediation defined as >10% change.")
+
+
+
+# SUPPLEMENTARY TABLE S2: WAIC
+waic_comparison %>%
+  mutate(
+    Outcome = c("Viral load", "CD4 count", "Physical QoL", "Mental QoL")
+  ) %>%
+  select(Outcome, waic_with_adh, waic_without_adh, waic_diff, better_model) %>%
+  kable(
+    caption = "Supplementary Table S2. WAIC Model Comparison",
+    digits = 2,
+    col.names = c("Outcome", "With Adherence", "Without Adherence", "ΔWAIC", "Better Model")
+  ) %>%
+  kable_styling(full_width = FALSE) %>%
+  footnote(
+    general = c(
+      "ΔWAIC = WAIC(without) - WAIC(with)",
+      "ΔWAIC < 5 indicates minimal difference, suggesting adherence is not a strong mediator."
+    )
+  )
+```
+
+
+
+
