@@ -1,0 +1,383 @@
+---
+title: "project2"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(gtsummary)
+library(gt)
+library(reshape2)
+library(WebPower)
+library(MASS)
+library(broom)
+library(scales)
+
+
+df <- read.csv("PrelimData.csv")
+
+str(df)
+dim(df)
+head(df)
+
+
+# Descriptive Statistics — TABLE 1
+tbl1 <- df %>%
+  tbl_summary(
+    statistic = list(all_continuous() ~ "{mean} ({sd}); [{min}, {max}]"),
+    digits    = all_continuous() ~ 2,
+    label = list(
+      CVLT_CNG3 ~ "CVLT Change Score (1-year)",
+      CORT_CNG3 ~ "Cortical Thickness Change (1-year, mm)",
+      IL_6      ~ "Baseline IL-6 (pg/mL)",
+      MCP_1     ~ "Baseline MCP-1 (pg/mL)"
+    )
+  ) %>%
+  modify_caption("**Table 1. Descriptive Statistics (n = 30)**") %>%
+  bold_labels()
+
+tbl1
+
+
+# Distribution Check + Outlier Detection
+shapiro_vars <- map_df(names(df), function(v) {
+  sw <- shapiro.test(df[[v]])
+  tibble(Variable = v, W = round(sw$statistic, 4), p = round(sw$p.value, 4))
+})
+print(shapiro_vars)
+
+# Outlier: > 3 SD from mean
+outlier_check <- map_df(names(df), function(v) {
+  flagged <- which(abs(scale(df[[v]])) > 3)
+  tibble(Variable  = v,
+         n_flagged = length(flagged),
+         subjects  = if (length(flagged) > 0) paste(flagged, collapse = ", ")
+                     else "none")
+})
+print(outlier_check)
+
+
+# Correlation Analysis — FIGURE 1
+# Rename for display
+df_display <- df %>%
+  rename(
+    `CVLT\n(Cognitive)`    = CVLT_CNG3,
+    `CORT\n(Cognitive)`    = CORT_CNG3,
+    `IL-6\n(Inflammation)` = IL_6,
+    `MCP-1\n(Inflammation)`= MCP_1
+  )
+
+cor_mat    <- cor(df_display, method = "pearson")
+cor_melted <- melt(round(cor_mat, 2))
+
+fig1 <- ggplot(cor_melted, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = value), size = 5, fontface = "bold") +
+  scale_fill_gradient2(
+    low      = "#4472C4",
+    mid      = "white",
+    high     = "#C0392B",
+    midpoint = 0,
+    limits   = c(-1, 1),
+    name     = "Correlation"
+  ) +
+  labs(title = "Figure 1. Pearson Correlation Matrix", x = NULL, y = NULL) +
+  theme_classic() +
+  theme(
+    axis.text.x  = element_text(angle = 30, hjust = 1, size = 10),
+    axis.text.y  = element_text(size = 10),
+    plot.title   = element_text(face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+
+print(fig1)
+
+# Pairwise cor.test for text reporting
+pairs <- list(
+  c("IL_6",  "CVLT_CNG3"), c("IL_6",  "CORT_CNG3"),
+  c("MCP_1", "CVLT_CNG3"), c("MCP_1", "CORT_CNG3"),
+  c("IL_6",  "MCP_1"),     c("CVLT_CNG3", "CORT_CNG3")
+)
+cor_tests <- map_df(pairs, function(p) {
+  ct <- cor.test(df[[p[1]]], df[[p[2]]])
+  tibble(Var1 = p[1], Var2 = p[2],
+         r    = round(ct$estimate, 3),
+         CI_L = round(ct$conf.int[1], 3),
+         CI_U = round(ct$conf.int[2], 3),
+         p    = round(ct$p.value, 4))
+})
+print(cor_tests)
+
+
+# Linear Regression — Aim 1a — TABLE 2
+m1 <- lm(CVLT_CNG3 ~ IL_6,  data = df)
+m2 <- lm(CORT_CNG3 ~ IL_6,  data = df)
+m3 <- lm(CVLT_CNG3 ~ MCP_1, data = df)
+m4 <- lm(CORT_CNG3 ~ MCP_1, data = df)
+
+summary(m1); summary(m2); summary(m3); summary(m4)
+
+tidy_model <- function(model, pred_name) {
+  tidy(model, conf.int = TRUE) %>%
+    filter(term != "(Intercept)") %>%
+    rename(Beta = estimate, SE = std.error,
+           CI_L = conf.low, CI_U = conf.high, p_value = p.value) %>%
+    mutate(Predictor = pred_name,
+           Outcome   = as.character(formula(model))[2],
+           R2        = round(summary(model)$r.squared, 3)) %>%
+    dplyr::select(Predictor, Outcome, Beta, SE, CI_L, CI_U, p_value, R2)
+}
+
+results <- bind_rows(
+  tidy_model(m1, "IL-6"),  tidy_model(m2, "IL-6"),
+  tidy_model(m3, "MCP-1"), tidy_model(m4, "MCP-1")
+) %>%
+  mutate(across(c(Beta, SE, CI_L, CI_U), ~ round(., 3)),
+         p_value = round(p_value, 4))
+
+print(results)
+
+tbl2 <- results %>%
+  gt() %>%
+  tab_header(
+    title    = "Table 2. Linear Regression Results - Aim 1a (n = 30)",
+    subtitle = "Unadjusted models; outcome = 1-year change score"
+  ) %>%
+  cols_label(
+    Predictor = "Predictor", Outcome = "Outcome",
+    Beta = "β", SE = "SE",
+    CI_L = "95% CI Lower", CI_U = "95% CI Upper",
+    p_value = "p-value", R2 = "R²"
+  ) %>%
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(columns = p_value, rows = p_value < 0.05)
+  ) %>%
+  tab_footnote(
+    "Bold p-values: statistically significant at alpha = 0.05.
+    Full models in the planned study will adjust for covariates including
+    baseline outcome, age, sex, education, APOE, and vascular risk factors."
+  )
+
+tbl2
+
+
+# Model Diagnostics (reported in Methods text, no figure)
+models      <- list(m1, m2, m3, m4)
+model_names <- c("IL-6->CVLT", "IL-6->CORT", "MCP-1->CVLT", "MCP-1->CORT")
+
+resid_sw <- map_df(seq_along(models), function(i) {
+  sw <- shapiro.test(residuals(models[[i]]))
+  tibble(Model = model_names[i], W = round(sw$statistic, 4),
+         p = round(sw$p.value, 4))
+})
+print(resid_sw)
+
+cooks_res <- map_df(seq_along(models), function(i) {
+  cd  <- cooks.distance(models[[i]])
+  inf <- which(cd > 4 / nrow(df))
+  tibble(Model   = model_names[i],
+         flagged = if (length(inf) > 0) paste(inf, collapse = ", ") else "none")
+})
+print(cooks_res)
+
+
+# Multiple Testing — Simulation
+set.seed(2024)
+n_sim          <- 100000
+cor_predictors <- cor(df[, c("IL_6", "MCP_1")])
+cor_outcomes   <- cor(df[, c("CVLT_CNG3", "CORT_CNG3")])
+n              <- nrow(df)
+min_pvals      <- numeric(n_sim)
+
+for (sim in 1:n_sim) {
+  X <- mvrnorm(n, mu = c(0, 0), Sigma = cor_predictors)
+  Y <- mvrnorm(n, mu = c(0, 0), Sigma = cor_outcomes)
+  p_vals <- c(
+    summary(lm(Y[,1] ~ X[,1]))$coefficients[2, 4],
+    summary(lm(Y[,2] ~ X[,1]))$coefficients[2, 4],
+    summary(lm(Y[,1] ~ X[,2]))$coefficients[2, 4],
+    summary(lm(Y[,2] ~ X[,2]))$coefficients[2, 4]
+  )
+  min_pvals[sim] <- min(p_vals)
+}
+
+adjusted_alpha   <- quantile(min_pvals, 0.05)
+bonferroni_alpha <- 0.05 / 4
+nominal_alpha    <- 0.05
+
+print(tibble(
+  Method = c("Nominal", "Simulation-based (FWER=0.05)", "Bonferroni"),
+  Alpha  = round(c(nominal_alpha, adjusted_alpha, bonferroni_alpha), 4)
+))
+
+
+# Power Analysis — TABLE 3 + FIGURE 2 + FIGURE 3
+n_planned <- 175
+p1_aim1   <- 7;  p2_aim1 <- 6
+p1_aim2   <- 10; p2_aim2 <- 9
+
+r_obs <- c(
+  "IL-6 -> CVLT"  = -0.2586,
+  "IL-6 -> CORT"  = -0.5993,
+  "MCP-1 -> CVLT" = -0.3184,
+  "MCP-1 -> CORT" = -0.6853
+)
+
+# TABLE 3: Power summary
+
+aim1_power <- map_df(names(r_obs), function(nm) {
+  r  <- abs(r_obs[nm])
+  f2 <- r^2 / (1 - r^2)
+  pw_adj <- wp.regression(n=n_planned, p1=p1_aim1, p2=p2_aim1,
+                           f2=f2, alpha=adjusted_alpha)
+  pw_nom <- wp.regression(n=n_planned, p1=p1_aim1, p2=p2_aim1,
+                           f2=f2, alpha=nominal_alpha)
+  tibble(Aim         = "Aim 1a",
+         Association = nm,
+         r           = round(r_obs[nm], 3),
+         f2          = round(f2, 4),
+         Power_adj   = round(pw_adj$power, 3),
+         Power_nom   = round(pw_nom$power, 3))
+})
+
+delta_r2_aim2 <- c(0.02, 0.03, 0.05, 0.08)
+r2_main       <- 0.15
+
+aim2_power <- map_df(delta_r2_aim2, function(dr2) {
+  r2_full <- r2_main + dr2
+  f2_incr <- dr2 / (1 - r2_full)
+  pw_adj  <- wp.regression(n=n_planned, p1=p1_aim2, p2=p2_aim2,
+                            f2=f2_incr, alpha=adjusted_alpha)
+  pw_nom  <- wp.regression(n=n_planned, p1=p1_aim2, p2=p2_aim2,
+                            f2=f2_incr, alpha=nominal_alpha)
+  tibble(Aim         = "Aim 2",
+         Association = paste0("Interaction (delta R2 = ", dr2, ")"),
+         r           = NA_real_,
+         f2          = round(f2_incr, 4),
+         Power_adj   = round(pw_adj$power, 3),
+         Power_nom   = round(pw_nom$power, 3))
+})
+
+power_all <- bind_rows(aim1_power, aim2_power)
+print(power_all)
+
+tbl3 <- power_all %>%
+  gt() %>%
+  tab_header(
+    title    = "Table 3. Estimated Statistical Power (n = 175)",
+    subtitle = paste0("Sim-adjusted alpha = ", round(adjusted_alpha, 3),
+                      "; nominal alpha = 0.05")
+  ) %>%
+  cols_label(
+    Aim         = "Aim",
+    Association = "Association / Effect",
+    r           = "Bivariate r",
+    f2          = "Cohen's f2",
+    Power_adj   = paste0("Power (sim-adj a=",
+                         round(adjusted_alpha, 3), ")"),
+    Power_nom   = "Power (a=0.05)"
+  ) %>%
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(columns = c(Power_adj, Power_nom),
+                           rows    = Power_adj >= 0.80)
+  ) %>%
+  tab_row_group(label = "Aim 2: Interaction Effect",
+                rows  = Aim == "Aim 2") %>%
+  tab_row_group(label = "Aim 1a: Main Effect",
+                rows  = Aim == "Aim 1a") %>%
+  tab_footnote(
+    "Bold = Power >= 0.80. Aim 1a: p1=7, p2=6 (1 marker + 6 covariates).
+    Aim 2: p1=10, p2=9 (SUVR + marker + interaction + baseline + 6 covariates).
+    Bivariate r from preliminary data (n=30) used as illustrative effect size
+    approximations; partial effects in adjusted models may differ.
+    Aim 1b and full marker set (IL-6, TNF-alpha, MCP-1, Eotaxin-1) will be
+    evaluated in the complete analytic dataset."
+  ) %>%
+  fmt_missing(columns = "r", missing_text = "-")
+
+tbl3
+
+# ── FIGURE 2: Power vs r (clean, no grey vertical lines) ─────────────────────
+
+r_range <- seq(0.10, 0.75, by = 0.005)
+
+power_curve <- map_df(r_range, function(r) {
+  f2 <- r^2 / (1 - r^2)
+  pw <- wp.regression(n=n_planned, p1=p1_aim1, p2=p2_aim1,
+                      f2=f2, alpha=adjusted_alpha)
+  tibble(r = r, power = pw$power)
+})
+
+min_r80 <- power_curve %>% filter(power >= 0.80) %>% slice(1) %>% pull(r)
+
+fig2 <- ggplot(power_curve, aes(x = r, y = power)) +
+  geom_line(color = "#4472C4", linewidth = 1.2) +
+  geom_hline(yintercept = 0.80, color = "red",
+             linetype = "dashed", linewidth = 0.9) +
+  geom_vline(xintercept = min_r80, color = "darkgreen",
+             linetype = "dashed", linewidth = 0.9) +
+  annotate("text", x = min_r80 + 0.02, y = 0.45,
+           label = paste0("r \u2248 ", round(min_r80, 2)),
+           color = "darkgreen", size = 4, hjust = 0) +
+  annotate("text", x = 0.65, y = 0.83,
+           label = "80% Power", color = "red", size = 4) +
+  scale_x_continuous(breaks = seq(0.1, 0.7, 0.1)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.25), labels = percent) +
+  labs(
+    title    = "Figure 2. Power vs Effect Size for Aim 1a (n = 175)",
+    subtitle = paste0("Covariate-adjusted model (p1=7, p2=6); ",
+                      "sim-adjusted alpha = ", round(adjusted_alpha, 3)),
+    x = "Effect size (r; bivariate estimates from preliminary data)",
+    y = "Statistical Power"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9, color = "gray40"))
+
+print(fig2)
+
+# FIGURE 3: Required sample size vs r
+
+r_for_n <- seq(0.10, 0.75, by = 0.005)
+
+n_required <- map_df(r_for_n, function(r) {
+  f2 <- r^2 / (1 - r^2)
+  lo <- 10; hi <- 2000
+  while (hi - lo > 1) {
+    mid <- floor((lo + hi) / 2)
+    pw  <- wp.regression(n=mid, p1=p1_aim1, p2=p2_aim1,
+                         f2=f2, alpha=adjusted_alpha)
+    if (pw$power >= 0.80) hi <- mid else lo <- mid
+  }
+  tibble(r = r, n_required = hi)
+})
+
+fig3 <- ggplot(n_required, aes(x = r, y = n_required)) +
+  geom_line(color = "#4472C4", linewidth = 1.2) +
+  geom_hline(yintercept = n_planned, color = "red",
+             linetype = "dashed", linewidth = 0.9) +
+  geom_vline(xintercept = min_r80, color = "darkgreen",
+             linetype = "dashed", linewidth = 0.9) +
+  annotate("text", x = min_r80 + 0.02, y = 700,
+           label = paste0("r \u2248 ", round(min_r80, 2)),
+           color = "darkgreen", size = 4, hjust = 0) +
+  annotate("text", x = 0.55, y = n_planned + 45,
+           label = paste0("n = ", n_planned, " (planned)"),
+           color = "red", size = 4) +
+  scale_x_continuous(breaks = seq(0.1, 0.7, 0.1)) +
+  scale_y_continuous(limits = c(0, 1000), breaks = seq(0, 1000, 200)) +
+  labs(
+    title    = "Figure 3. Required Sample Size vs Effect Size for Aim 1a",
+    subtitle = paste0("Target power = 80%; covariate-adjusted model (p1=7, p2=6); ",
+                      "sim-adjusted alpha = ", round(adjusted_alpha, 3)),
+    x = "Effect size (r; bivariate estimates from preliminary data)",
+    y = "Required Sample Size"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9, color = "gray40"))
+
+print(fig3)
+```
