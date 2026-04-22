@@ -51,7 +51,7 @@ c(strokes_10y = sum(baseline$event10),
 ```
 
 ```{r}
-# 3. Missing data assessment
+# 3. Missing data
 candidate_vars <- c("AGE", "SYSBP", "DIABETES", "CURSMOKE",
                     "PREVCHD", "BPMEDS", "TOTCHOL", "BMI")
 
