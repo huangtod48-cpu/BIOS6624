@@ -1,0 +1,344 @@
+---
+title: "project3"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(survival)
+  library(survminer)
+  library(gtsummary)
+  library(broom)
+})
+set.seed(12345)
+```
+
+```{r}
+# 1. Load and filter baseline cohort
+frm_raw  <- read.csv("frmgham2.csv", stringsAsFactors = FALSE)
+baseline <- frm_raw %>% filter(PERIOD == 1, PREVSTRK == 0)
+nrow(baseline)
+```
+
+```{r}
+# 2. Construct 10-year event and follow-up time
+baseline <- baseline %>%
+  mutate(
+    stroke_in_10y = as.integer(STROKE == 1 & TIMESTRK <= 3650),
+    time10 = case_when(
+      stroke_in_10y == 1           ~ TIMESTRK,
+      DEATH == 1 & TIMEDTH <= 3650 ~ TIMEDTH,
+      TRUE                         ~ pmin(TIMESTRK, TIMEDTH, 3650, na.rm = TRUE)
+    ),
+    event10 = stroke_in_10y,
+    death10 = as.integer(DEATH == 1 & TIMEDTH <= 3650 & stroke_in_10y == 0),
+    SEX_f      = factor(SEX,      levels = c(1, 2), labels = c("Men", "Women")),
+    CURSMOKE_f = factor(CURSMOKE, levels = c(0, 1), labels = c("No", "Yes")),
+    DIABETES_f = factor(DIABETES, levels = c(0, 1), labels = c("No", "Yes")),
+    BPMEDS_f   = factor(BPMEDS,   levels = c(0, 1), labels = c("No", "Yes")),
+    PREVCHD_f  = factor(PREVCHD,  levels = c(0, 1), labels = c("No", "Yes")),
+    Stroke10_f = factor(event10,  levels = c(0, 1), labels = c("No", "Yes")),
+    Death10_f  = factor(death10,  levels = c(0, 1), labels = c("No", "Yes"))
+  )
+
+c(strokes_10y = sum(baseline$event10),
+  deaths_10y_no_stroke = sum(baseline$death10))
+```
+
+```{r}
+# 3. Missing data assessment
+candidate_vars <- c("AGE", "SYSBP", "DIABETES", "CURSMOKE",
+                    "PREVCHD", "BPMEDS", "TOTCHOL", "BMI")
+
+baseline %>%
+  select(all_of(candidate_vars)) %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  mutate(pct_missing = round(100 * n_missing / nrow(baseline), 2))
+```
+
+```{r}
+# 4. Table 1: Baseline characteristics (full eligible cohort)
+tab1_vars <- c("AGE", "SYSBP", "TOTCHOL", "BMI",
+               "DIABETES_f", "CURSMOKE_f", "BPMEDS_f", "PREVCHD_f",
+               "Stroke10_f", "Death10_f")
+
+baseline %>%
+  select(all_of(tab1_vars), SEX_f) %>%
+  tbl_summary(
+    by = SEX_f,
+    statistic = list(all_continuous()  ~ "{mean} ({sd})",
+                     all_categorical() ~ "{n} ({p}%)"),
+    digits    = list(all_continuous()  ~ 1,
+                     all_categorical() ~ c(0, 1)),
+    missing      = "ifany",
+    missing_text = "Missing",
+    label     = list(
+      AGE        ~ "Age (years)",
+      SYSBP      ~ "Systolic BP (mmHg)",
+      TOTCHOL    ~ "Total cholesterol (mg/dL)",
+      BMI        ~ "BMI (kg/m^2)",
+      DIABETES_f ~ "Diabetes mellitus",
+      CURSMOKE_f ~ "Current smoker",
+      BPMEDS_f   ~ "Antihypertensive medication",
+      PREVCHD_f  ~ "Prevalent CHD",
+      Stroke10_f ~ "Stroke within 10 years",
+      Death10_f  ~ "Death within 10 years"
+    )
+  ) %>%
+  add_overall() %>%
+  modify_header(label = "**Characteristic**") %>%
+  modify_caption("Table 1. Baseline characteristics of eligible participants by sex.") %>%
+  modify_footnote(all_stat_cols() ~ "Mean (SD); n (%). Complete-case analysis excludes participants missing total cholesterol, antihypertensive medication, or BMI, yielding 1,897 men and 2,378 women.")
+```
+
+```{r}
+# 5. SYSBP and diabetes across Periods 1-3
+frm_raw %>%
+  filter(RANDID %in% baseline$RANDID, PERIOD %in% 1:3) %>%
+  group_by(PERIOD) %>%
+  summarise(
+    n           = n(),
+    sysbp_mean  = round(mean(SYSBP, na.rm = TRUE), 1),
+    sysbp_sd    = round(sd(SYSBP,   na.rm = TRUE), 1),
+    diabetes_n  = sum(DIABETES == 1, na.rm = TRUE),
+    diabetes_pc = round(mean(DIABETES == 1, na.rm = TRUE) * 100, 2),
+    .groups = "drop"
+  )
+```
+
+```{r}
+# 6. Complete-case dataset for modeling
+model_vars <- c("AGE", "SYSBP", "DIABETES", "CURSMOKE",
+                "PREVCHD", "BPMEDS", "TOTCHOL", "BMI",
+                "SEX", "time10", "event10")
+
+cc    <- baseline %>% select(all_of(model_vars)) %>% drop_na()
+men   <- cc %>% filter(SEX == 1)
+women <- cc %>% filter(SEX == 2)
+
+c(n_total = nrow(cc), n_men = nrow(men), n_women = nrow(women),
+  events_men = sum(men$event10), events_women = sum(women$event10))
+```
+
+```{r fig.width=7, fig.height=5}
+# 7. Kaplan-Meier curves by sex (Figure 1)
+km_fit <- survfit(Surv(time10, event10) ~ SEX, data = cc)
+
+ggsurvplot(
+  km_fit, data = cc,
+  conf.int      = TRUE,
+  risk.table    = TRUE,
+  legend.labs   = c("Men", "Women"),
+  legend.title  = "",
+  xlab          = "Days from baseline",
+  ylab          = "Stroke-free survival probability",
+  palette       = c("#2C7FB8", "#D95F0E"),
+  xlim          = c(0, 3650),
+  ylim          = c(0.90, 1.00),
+  break.time.by = 730,
+  ggtheme       = theme_minimal(base_size = 12)
+)
+```
+
+```{r}
+# 8a. Variable selection: per-sex backward AIC
+# Forced: AGE, SYSBP, DIABETES (investigator specification)
+run_selection <- function(dat) {
+  full_fit <- coxph(
+    Surv(time10, event10) ~ AGE + SYSBP + DIABETES + CURSMOKE +
+                            PREVCHD + BPMEDS + TOTCHOL + BMI,
+    data = dat
+  )
+  lower_fit <- Surv(time10, event10) ~ AGE + SYSBP + DIABETES
+  step(full_fit,
+       scope     = list(lower = lower_fit, upper = formula(full_fit)),
+       direction = "backward", trace = 0)
+}
+
+selection_men   <- run_selection(men)
+selection_women <- run_selection(women)
+
+vars_men   <- attr(terms(selection_men),   "term.labels")
+vars_women <- attr(terms(selection_women), "term.labels")
+
+data.frame(
+  candidate      = candidate_vars,
+  retained_men   = candidate_vars %in% vars_men,
+  retained_women = candidate_vars %in% vars_women
+)
+```
+
+```{r}
+# 8b. Confounding check: 10% change-in-estimate rule
+check_confounding <- function(dat, final_vars, dropped_vars, threshold = 0.10) {
+  base_fit <- coxph(reformulate(final_vars, response = "Surv(time10, event10)"), 
+                    data = dat)
+  base_hrs <- exp(coef(base_fit))
+  
+  result <- data.frame(dropped_var = character(), max_change = numeric(),
+                       is_confounder = logical())
+  
+  for (v in dropped_vars) {
+    test_fit <- coxph(reformulate(c(final_vars, v), 
+                                  response = "Surv(time10, event10)"), 
+                      data = dat)
+    test_hrs <- exp(coef(test_fit))[names(base_hrs)]
+    pct_change <- abs((test_hrs - base_hrs) / base_hrs)
+    max_chg <- max(pct_change, na.rm = TRUE)
+    
+    result <- rbind(result, data.frame(
+      dropped_var   = v,
+      max_change    = round(max_chg, 3),
+      is_confounder = max_chg > threshold
+    ))
+  }
+  result
+}
+
+dropped_men   <- setdiff(candidate_vars, vars_men)
+dropped_women <- setdiff(candidate_vars, vars_women)
+
+conf_men   <- check_confounding(men,   vars_men,   dropped_men)
+conf_women <- check_confounding(women, vars_women, dropped_women)
+
+conf_men
+conf_women
+```
+
+```{r}
+# 9. FINAL models for inference (HR, PH tests come from these)
+final_formula_men   <- reformulate(vars_men,   response = "Surv(time10, event10)")
+final_formula_women <- reformulate(vars_women, response = "Surv(time10, event10)")
+
+final_men   <- coxph(final_formula_men,   data = men)
+final_women <- coxph(final_formula_women, data = women)
+
+summary(final_men)
+summary(final_women)
+```
+
+```{r}
+# 10. Hazard ratio table (from AIC-selected final models)
+fmt_hr <- function(fit, sex_label, n_obs, n_events) {
+  tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+    transmute(
+      Sex      = sex_label,
+      n        = n_obs,
+      events   = n_events,
+      Variable = term,
+      HR       = round(estimate,  3),
+      LCL      = round(conf.low,  3),
+      UCL      = round(conf.high, 3),
+      p_value  = signif(p.value,  3)
+    )
+}
+
+bind_rows(
+  fmt_hr(final_men,   "Men",   nrow(men),   sum(men$event10)),
+  fmt_hr(final_women, "Women", nrow(women), sum(women$event10))
+)
+```
+
+```{r}
+# 11. Proportional hazards assumption (on AIC-selected final models)
+zph_men   <- cox.zph(final_men)
+zph_women <- cox.zph(final_women)
+
+zph_men
+zph_women
+```
+
+```{r fig.width=9, fig.height=5}
+par(mfrow = c(1, 2))
+plot(survfit(Surv(time10, event10) ~ DIABETES, data = men),
+     fun = "cloglog", xlab = "log(days)", ylab = "log(-log S(t))",
+     col = c("black", "red"), main = "Men: DIABETES")
+legend("bottomright", c("No", "Yes"), col = c("black", "red"), lty = 1, bty = "n")
+plot(survfit(Surv(time10, event10) ~ DIABETES, data = women),
+     fun = "cloglog", xlab = "log(days)", ylab = "log(-log S(t))",
+     col = c("black", "red"), main = "Women: DIABETES")
+legend("bottomright", c("No", "Yes"), col = c("black", "red"), lty = 1, bty = "n")
+```
+
+```{r}
+# 12. 10-year stroke probability: 5 symmetric scenarios for both sexes
+# Extended model for women (scenario prediction only)
+final_women_pred <- coxph(
+  Surv(time10, event10) ~ AGE + SYSBP + DIABETES + CURSMOKE,
+  data = women
+)
+
+ages <- c(40, 50, 60)
+
+profile_grid <- tibble(
+  scenario = c("No risk factors", "High BP (SBP=160)", "Diabetes",
+               "High BP + diabetes", "Current smoking"),
+  SYSBP    = c(120, 160, 120, 160, 120),
+  DIABETES = c(  0,   0,   1,   1,   0),
+  CURSMOKE = c(  0,   0,   0,   0,   1)
+)
+
+predict_10y <- function(fit, profiles_df, ages_vec) {
+  grid <- profiles_df %>%
+    slice(rep(seq_len(n()), each = length(ages_vec))) %>%
+    mutate(AGE = rep(ages_vec, times = nrow(profiles_df)))
+  sf     <- survfit(fit, newdata = grid)
+  s_3650 <- summary(sf, times = 3650)$surv
+  grid$prob_10y <- round((1 - as.numeric(s_3650)) * 100, 1)
+  grid[, c("scenario", "AGE", "prob_10y")]
+}
+
+pred_men   <- predict_10y(final_men,        profile_grid, ages) %>% mutate(SEX = "Men")
+pred_women <- predict_10y(final_women_pred, profile_grid, ages) %>% mutate(SEX = "Women")
+
+bind_rows(pred_men, pred_women) %>%
+  select(SEX, scenario, AGE, prob_10y) %>%
+  pivot_wider(names_from = AGE, values_from = prob_10y, names_prefix = "Age_")
+```
+
+```{r fig.width=10, fig.height=5}
+# 12b. Model-based survival curves at age 60 (using same models as Section 12)
+curve_profiles <- profile_grid %>% mutate(AGE = 60)
+
+sf_men_curve   <- survfit(final_men,        newdata = curve_profiles)
+sf_women_curve <- survfit(final_women_pred, newdata = curve_profiles)
+
+par(mfrow = c(1, 2), mar = c(4.5, 4.5, 3, 1))
+cols <- c("#2C7FB8", "#41B6C4", "#7FCDBB", "#FEB24C", "#D95F0E")
+
+plot(sf_men_curve, col = cols, lwd = 2,
+     xlab = "Days from baseline", ylab = "Stroke-free survival probability",
+     main = "Men (age 60)", ylim = c(0.70, 1.00), xlim = c(0, 3650))
+legend("bottomleft", legend = curve_profiles$scenario,
+       col = cols, lwd = 2, bty = "n", cex = 0.8)
+
+plot(sf_women_curve, col = cols, lwd = 2,
+     xlab = "Days from baseline", ylab = "Stroke-free survival probability",
+     main = "Women (age 60)", ylim = c(0.70, 1.00), xlim = c(0, 3650))
+legend("bottomleft", legend = curve_profiles$scenario,
+       col = cols, lwd = 2, bty = "n", cex = 0.8)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
